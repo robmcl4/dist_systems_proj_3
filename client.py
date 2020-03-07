@@ -212,8 +212,7 @@ def handle_user_command():
     """
     cmd = sys.stdin.readline().strip().lower()
     if cmd == 'b':
-        # TODO fill this in...
-        print('missing...')
+        print('Own balance {0:.2f}'.format(query_balance(my_id)))
     if cmd == 'q':
         for c in clients:
             logging.info('shutting down...')
@@ -248,7 +247,7 @@ def save_state():
     with open(fname, "w") as f:
         sz_blocks = base64.b64encode(pickle.dumps(blockchain)).decode("ascii")
         sz_local_txns = base64.b64encode(pickle.dumps(local_transactions)).decode("ascii")
-        f.write("{0} {1} {2}".format(proposal_num, sz_blocks, sz_local_txns)
+        f.write("{0} {1} {2}".format(proposal_num, sz_blocks, sz_local_txns))
     logging.info("Persisted blockchain in file {0}".format(fname))
 
 
