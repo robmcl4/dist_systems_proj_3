@@ -70,6 +70,11 @@ proposal_num = 1
 # List of connected clients
 clients = []
 
+# Whether to accept user-input commands.
+# This can be turned off, for example, while contending
+# for leadership.
+accept_user_commands = True
+
 # Implementation -------------------------------------------
 
 def main():
@@ -119,7 +124,8 @@ def listen_loop(srv_sock):
     Main loop listening for updates on sockets and such
     """
     while True:
-        print_menu()
+        if accept_user_commands:
+            print_menu()
         (rdy, _, _) = select.select(
             [*map(lambda x: x.socket, clients), sys.stdin, srv_sock],
             [],
@@ -128,11 +134,12 @@ def listen_loop(srv_sock):
         if len(rdy) > 0:
             ready = rdy[0]
             if ready != sys.stdin:
-                # for tidiness, print a newline so log messages
-                # don't appear on the same line as as user input
-                # prompt
-                sys.stdout.write('\n')
-                sys.stdout.flush()
+                if accept_user_commands:
+                    # for tidiness, print a newline so log messages
+                    # don't appear on the same line as as user input
+                    # prompt
+                    sys.stdout.write('\n')
+                    sys.stdout.flush()
                 if ready == srv_sock:
                     # accept new clients
                     accept_cxn(srv_sock)
@@ -160,7 +167,6 @@ def accept_cxn(sock):
     else:
         from_sock.close()
         logging.error('malformed ident {0}'.format(ba[:num_recv]))
-
 
 
 def handle_channel_update(ready_channel):
