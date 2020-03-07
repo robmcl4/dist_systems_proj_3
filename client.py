@@ -124,10 +124,13 @@ def listen_loop(srv_sock):
     Main loop listening for updates on sockets and such
     """
     while True:
+        # set up select() so we can handle input one at a time
+        inputs = [*map(lambda x: x.socket, clients), srv_sock]
         if accept_user_commands:
             print_menu()
+            inputs.append(sys.stdin)
         (rdy, _, _) = select.select(
-            [*map(lambda x: x.socket, clients), sys.stdin, srv_sock],
+            inputs,
             [],
             []
         )
