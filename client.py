@@ -30,6 +30,9 @@ BASE_PORT_NUMBER = 54322
 
 STARTING_BALANE = 10.0
 
+# how long to wait before sending a message (seconds)
+SLEEP_TIME = 5
+
 # TYPES ----------------------------------------------------
 
 Client = collections.namedtuple(
@@ -75,6 +78,9 @@ clients = []
 # for leadership.
 accept_user_commands = True
 
+# The highest previous Promise performed in the Paxos leader-election
+highest_promise = {"epoch": -1, "client_id": -1, "proposal_num": -1}
+
 # Implementation -------------------------------------------
 
 def main():
@@ -85,10 +91,7 @@ def main():
         print("Please enter a process index (1,2,3,...)")
         exit(1)
     my_id = int(sys.argv[1])
-    if len(sys.argv) < 3:
-        print("Please enter the number of processes (2,3...)")
-        exit(1)
-    max_id = int(sys.argv[2])
+    max_id = 3 # we'll only have 3 clients anyway...
 
     # (outbound) connect to other clients
     print('max id', max_id)
@@ -204,6 +207,13 @@ def handle_channel_update(ready_channel):
     body = json.loads(base64.b64decode(body).decode('ascii'))
 
     logging.info('received {0} from client {1}'.format(cmd, client.id))
+    
+    if cmd == 'PREPARE':
+        handle_prepare(client, body)
+    elif cmd == 'PROMISE':
+        handle_promise(client, body)
+    else:
+        logging.info('unknown command: {0}'.format(cmd))
 
 
 def handle_user_command():
@@ -213,12 +223,77 @@ def handle_user_command():
     cmd = sys.stdin.readline().strip().lower()
     if cmd == 'b':
         print('Own balance {0:.2f}'.format(query_balance(my_id)))
-    if cmd == 'q':
+    elif cmd == 'p':
+        # FOR DEBUGGING ONLY: initiate a paxos round
+        initiate_leader_election()
+    elif cmd == 'q':
         for c in clients:
             logging.info('shutting down...')
             c.socket.close()
             exit(0)
+    else:
+        print('unknown command', cmd)
 
+# Helpers for user commands ------------------------------------
+
+def initiate_leader_election():
+    global proposal_num
+    global accept_user_commands
+    accept_user_commands = False
+    proposal_num += 1
+    save_state()
+
+    # broadcast PREPARE
+    data = {"proposal_num": proposal_num, "epoch": len(blockchain)}
+    logging.info("Initiating leader election for proposal_num {0}, epoch {1}".format(proposal_num, len(blockchain)))
+    for c in clients:
+        send_message(c, "PREPARE", data)
+
+
+# Helpers for client commands ------------------------------------
+
+def handle_promise(client, data):
+    """
+    Handles a PROMISE message from the given client.
+
+    NOTE: since we're only doing 3 nodes, one promise indicates
+    leadership attained
+    """
+    logging.info("Leadership attained...")
+
+
+def handle_prepare(client, data):
+    """
+    Handles a PREPARE from the given client and payload
+    """
+    if data['epoch'] < len(blockchain):
+        # If the epoch number is old, respond with existing block
+        resp_data = {"existing_block": blockchain[data['epoch']]}
+        logging.info('PROMISE was for old epoch {0}'.format(data['epoch']))
+        send_message(client, "USE_EXISTING", resp_data)
+    elif highest_promise['epoch'] == data['epoch'] and (
+                highest_promise['client_id'] > client.id
+                or
+                (
+                    highest_promise['client_id'] == client.id and
+                    highest_promise['proposal_num'] > data['proposal_num']
+                )
+                ):
+        # If we've done PROMISE for a higher client_id or proposal_num,
+        # then NACK
+        send_message(client, "PROMISE_NACK", None)
+    else:
+        assert data['epoch'] == len(blockchain)
+        # All seems well, continue with the promise
+        highest_promise['epoch'] = data['epoch']
+        highest_promise['proposal_num'] = data['proposal_num']
+        highest_promise['client_id'] = client.id
+        save_state()
+        logging.info('Promising client {0} with proposal {1} for epoch {2}'.format(client.id, data['proposal_num'], data['epoch']))
+        send_message(client, "PROMISE", None)
+
+
+# Helpers for both user and client  commands ---------------------
 
 def query_balance(peer_id):
     """
@@ -247,7 +322,8 @@ def save_state():
     with open(fname, "w") as f:
         sz_blocks = base64.b64encode(pickle.dumps(blockchain)).decode("ascii")
         sz_local_txns = base64.b64encode(pickle.dumps(local_transactions)).decode("ascii")
-        f.write("{0} {1} {2}".format(proposal_num, sz_blocks, sz_local_txns))
+        sz_highest_promise = base64.b64encode(pickle.dumps(highest_promise))
+        f.write("{0} {1} {2} {3}".format(proposal_num, sz_blocks, sz_local_txns, sz_highest_promise))
     logging.info("Persisted blockchain in file {0}".format(fname))
 
 
@@ -258,15 +334,17 @@ def restore_saved_state():
     global proposal_num
     global blockchain
     global local_transactions
+    global highest_promise
     fname = "chain.{0}.json".format(my_id)
     logging.info("Examining {0} for previous blockchains".format(fname))
     try:
         with open(fname) as f:
             txt = f.read()
-            sz_proposal_num, b64chains, b64locals = txt.split(' ')
+            sz_proposal_num, b64chains, b64locals, b64promise = txt.split(' ')
             proposal_num = int(sz_proposal_num)
             blockchain = pickle.loads(base64.b64decode(b64chains))
-            local_transactions = pickle.loads(base64.b64decode(local_transactions))
+            local_transactions = pickle.loads(base64.b64decode(b64locals))
+            highest_promise = pickle.loads(base64.b64decode(b64promise))
             logging.info("Restored {0} blocks, {1} unsent transactions, and proposal_num = {2}".format(
                 len(blockchain),
                 len(local_transactions),
@@ -274,6 +352,20 @@ def restore_saved_state():
             ))
     except FileNotFoundError:
         logging.info("No backup found.")
+
+
+def send_message(client, command, data):
+    """
+    Helper function: sends a command to a client
+
+    client: a Client namedtuple
+    command: str, the command
+    data: json-serializable object
+    """
+    logging.info('Sending {0} to {1} ...'.format(command, client.id))
+    b64_data = base64.b64encode(json.dumps(data).encode('ascii'))
+    time.sleep(SLEEP_TIME)
+    client.socket.send(command.encode('ascii') + b' ' + b64_data)
 
 
 if __name__ == '__main__':
