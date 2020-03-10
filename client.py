@@ -16,7 +16,6 @@ import pickle
 import json
 import time
 import collections
-
 # SETUP ---------------------------------------------------
 
 logging.basicConfig(
@@ -61,7 +60,7 @@ Block = collections.namedtuple(
 # List of Blocks, most recent block out front
 blockchain = []
 
-# List of unsubmitted (local-only) transactions
+# List of uncommitted (local-only) transactions
 local_transactions = []
 
 # This pocess' ID (they start at 1 and increase)
@@ -81,6 +80,22 @@ accept_user_commands = True
 # The highest previous Promise performed in the Paxos leader-election
 highest_promise = {"epoch": -1, "client_id": -1, "proposal_num": -1}
 
+# one accepted msg is enough for commit phase but the leader should not ignore other incoming accepted req
+received_accepted_msgs = []
+
+# to localy save clients transaction (in case that the client needs to run Paxos to update balances, it needs to have access to this very last txn later)
+# format is the same as tnx = {"sender","recipient","amount"}
+last_unsumbmited_users_txn = {}
+
+# a flag for not sending accept request to other nodes after leader election
+paxos_for_debug = False
+
+# set this flag to prevent double sending ACCEPT request after leader attained ledaership
+already_became_leader = False
+
+# since after receiving the first ACCEPTED client can multicast COMMIT msg there is no need to send
+# COMMIT per received ACCEPTED msg
+already_multicast_commit = False
 # Implementation -------------------------------------------
 
 def main():
@@ -115,7 +130,7 @@ def main():
     sock.bind(("localhost", BASE_PORT_NUMBER - 1 + my_id))
     sock.listen(5)
     logging.info("listening for connections on port {0}".format(BASE_PORT_NUMBER - 1 + my_id))
-    
+
     restore_saved_state()
 
     # begin poll loop
@@ -207,11 +222,17 @@ def handle_channel_update(ready_channel):
     body = json.loads(base64.b64decode(body).decode('ascii'))
 
     logging.info('received {0} from client {1}'.format(cmd, client.id))
-    
+
     if cmd == 'PREPARE':
         handle_prepare(client, body)
     elif cmd == 'PROMISE':
         handle_promise(client, body)
+    elif cmd == "ACCEPT": # from leader to other clients
+        handle_accept(client, body)
+    elif cmd == "ACCEPTED": #from clients to the leader
+        handle_accepted(client, body)
+    elif cmd == "COMMIT":
+        handle_commit(client, body)
     else:
         logging.info('unknown command: {0}'.format(cmd))
 
@@ -225,8 +246,27 @@ def handle_user_command():
         print('Own balance {0:.2f}'.format(query_balance(my_id)))
     elif cmd == 'p':
         # FOR DEBUGGING ONLY: initiate a paxos round
+        paxos_for_debug = True
         initiate_leader_election()
-    elif cmd == 'q':
+    elif cmd == 't':
+        while True:
+            try:
+                peer = int(input('Transacting. Send to which peer?: '))
+                if peer != my_id and peer in range(4):
+                    break
+            except ValueError:
+                pass
+            print('invalid peer id')
+        while True:
+            try:
+                amt = float(input('What amount?: '))
+                if amt > 0:
+                    break
+            except ValueError:
+                pass
+            print('invalid amount')
+        handle_transaction(my_id, peer, amt)
+    elif cmd == 'q': #TODOD: how to simulate servers' crash (temporary out-of-service)
         for c in clients:
             logging.info('shutting down...')
             c.socket.close()
@@ -239,7 +279,11 @@ def handle_user_command():
 def initiate_leader_election():
     global proposal_num
     global accept_user_commands
+    global already_became_leader
+
     accept_user_commands = False
+    already_became_leader = False
+
     proposal_num += 1
     save_state()
 
@@ -259,8 +303,13 @@ def handle_promise(client, data):
     NOTE: since we're only doing 3 nodes, one promise indicates
     leadership attained
     """
+    global already_became_leader
+
     logging.info("Leadership attained...")
 
+    if not already_became_leader and not paxos_for_debug:
+        already_became_leader = True
+        run_accept_phase_by_leader()
 
 def handle_prepare(client, data):
     """
@@ -293,24 +342,186 @@ def handle_prepare(client, data):
         send_message(client, "PROMISE", None)
 
 
-# Helpers for both user and client  commands ---------------------
+# Add a transaction to the client's local_transactions list
+def update_local_transactions(txn):
+    """
+    Perform an-uncommitted transaction and added to the local_transactions
 
+    note: this function could be called when the local balance is enough
+    or after running Paxos and updating the blockchain
+    """
+    global local_transactions
+
+    if query_balance(my_id) >= txn["amount"]:
+
+        local_transactions.append(txn)
+        logging.info('client {0}: Updated local transactions: {1}'.format(my_id,json.dumps(local_transactions)))
+        print("successful transaction from {0} to {1} for ${2}".format(txn["sender"], txn["recipient"], txn["amount"]))
+
+        last_unsumbmited_users_txn = {}# empty out the list
+    else:
+        print("Aborted transaction from {0} to {1} for ${2} (balance is not enough)".format(tnx["sender"], txn["recipient"], txn["amount"]))
+
+
+def update_block_chain(block, seq_num):
+    """
+    Add a block containing all commited local transactions to the ledger
+    Empty the local transactions of the client
+    """
+    global blockchain
+    global local_transactions
+
+    blockchain.append(
+    {
+        "transactions":block,
+        "sequence_num": seq_num
+    })
+    local_transactions = []
+    logging.info("Client {0}: Updated my blockchain with {1}".format(my_id, json.dumps(block)))
+
+def handle_transaction(my_id, peer, amt):
+    """
+    Handles a transaction request
+    step I: if the balance is enough -> add txn to the local_transactions list
+    step II: otherwise, runs leader election (repeat step I)
+    Output: Success (if balance was enough), or Abort
+    """
+    global proposal_num
+    global accept_user_commands
+    global last_unsumbmited_users_txn
+
+    accept_user_commands = False
+
+    last_unsumbmited_users_txn = {
+        "recipient": peer,
+        "sender": my_id,
+        "amount": amt,
+        }
+    estimate_balance = query_balance(my_id)
+    if (amt <= estimate_balance):
+        update_local_transactions(last_unsumbmited_users_txn)
+        accept_user_commands = True
+    else:
+        initiate_leader_election()
+
+        #TODO: show the abort msg if client chould'nt become a leader
+        # logging.info('Transaction from client {0} to {1} for ${2} aborted. Client {0} couldnt manage to become a leader'.format(my_id,peer,amt))
+        # accept_user_commands = True
+
+def run_accept_phase_by_leader():
+    """
+    When the client got elected, it can send accept msg to others (for the last unsumbitted txn)
+    """
+    global proposal_num
+    global local_transactions
+
+    proposal_num += 1
+    data = {"TX":local_transactions, "proposal_num": proposal_num}
+    for c in clients:
+        send_message(c, "ACCEPT", data)
+
+
+def handle_accept(client, data):
+    """
+    Handles an ACCEPT request from the given client and payload
+    """
+    global proposal_num
+
+    if data['proposal_num'] < proposal_num:
+        # this is an old accept message
+        #(e.g, after a server became a leader, another one asked for election
+        # so the firts leader should not be able to multicast accept/commit msgs)
+        logging.info("client {}:Ignore ACCEPT message from client {} since the ballot number is outdated".format(my_id, client.id))
+
+    else:
+        data = {"TX":local_transactions, "proposal_num": proposal_num}
+        logging.info("client {}: ACCEPTED client {}'s accept request with ballot num {}'".format(my_id, client.id, data['proposal_num']))
+        send_message(client, "ACCEPTED", data)
+
+
+def handle_accepted(client, body):
+    """
+        Handles an ACCEPTED request from the given client and payload
+        NOTE: since we're only doing 3 nodes, one accepted leades to a commit phase
+        BUT leader should make sure to receive ALL ACCEPTED messages
+    """
+    global received_accepted_msgs
+    global already_multicast_commit
+
+    received_accepted_msgs.append(body['TX'])
+    time.sleep(SLEEP_TIME)
+
+    logging.info("client {0}: Received {1} accepted msg ... (ready to commit)".format(my_id, len(received_accepted_msgs)))
+
+    if not already_multicast_commit:
+        run_commit_phase_by_leader(received_accepted_msgs)
+        already_multicast_commit = True
+
+    accept_user_commands = True
+
+
+# After collecting all ACCEPTED messages, it's time to commit
+def run_commit_phase_by_leader(clients_local_transactions):
+    """
+    When client received f ACCEPTED msg it will generate block B and multicast COMMIT
+    """
+    global blockchain
+    global local_transactions
+    global proposal_num
+    global already_became_leader
+    global already_multicast_commit
+
+    block = local_transactions
+    for txn in clients_local_transactions:
+        block.extend(txn)
+    #seq_num = len(blockchain) ?
+
+    data = {"block": block, "proposal_num": proposal_num}
+    for c in clients:
+        send_message(c,"COMMIT",data)
+
+    update_block_chain(block, proposal_num)
+
+    clients_local_transactions = []# empty out the list
+    update_local_transactions(last_unsumbmited_users_txn)
+
+    accept_user_commands = True
+    already_became_leader = False
+    already_multicast_commit = False
+
+def handle_commit(client, body):
+    """
+    Handles a COMMIT request from the given client and payload
+    """
+    update_block_chain(body['block'], body['proposal_num'])
+    logging.info("client {0}: Receive a COMMIT request from client {1} with block: {2}".format(my_id, client.id,json.dumps(body['block'])))
+
+
+# Helpers for both user and client  commands ---------------------
 def query_balance(peer_id):
     """
     Returns the best-guess estimate of the given peer's balance,
     based on locally available information.
     """
     balance = STARTING_BALANE
-    for b in blockchain:
-        if b.recipient == peer_id:
-            balance += b.amount
-        if b.sender == peer_id:
-            balance -= b.amount
+    for block in blockchain:
+        for txn in block["transactions"]:
+            if txn["recipient"] == peer_id:
+                balance += txn["amount"]
+            if txn["sender"] == peer_id:
+                balance -= txn["amount"]
+
+    for txn in local_transactions:
+        if txn["recipient"] == peer_id:
+            balance += txn["amount"]
+        if txn["sender"] == peer_id:
+            balance -= txn["amount"]
+
     return balance
 
 
 def print_menu():
-    sys.stdout.write("[B]alance [Q]uit: ")
+    sys.stdout.write("[B]alance [Q]uit: [T]ransfer money [E]nable crash mode?!")
     sys.stdout.flush()
 
 
