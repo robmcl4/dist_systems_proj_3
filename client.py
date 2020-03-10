@@ -81,7 +81,7 @@ accept_user_commands = True
 highest_promise = {"epoch": -1, "client_id": -1, "proposal_num": -1}
 
 # one accepted msg is enough for commit phase but the leader should not ignore other incoming accepted req
-received_accepted_msgs = []
+#received_accepted_msgs = []
 
 # to localy save clients transaction (in case that the client needs to run Paxos to update balances, it needs to have access to this very last txn later)
 # format is the same as tnx = {"sender","recipient","amount"}
@@ -280,9 +280,11 @@ def initiate_leader_election():
     global proposal_num
     global accept_user_commands
     global already_became_leader
+    global already_multicast_commit
 
     accept_user_commands = False
     already_became_leader = False
+    already_multicast_commit = False
 
     proposal_num += 1
     save_state()
@@ -342,6 +344,23 @@ def handle_prepare(client, data):
         send_message(client, "PROMISE", None)
 
 
+def does_commited_block_has_my_transactions(block):
+    """
+    To check whether client's local transactions apperas in the COMMIT msg
+
+    Since the leader multicasts commit based on the first ACCEPTED msg
+    if the client does not see her transactions in the commited blocks
+    she should still keep them locally
+    """
+    block_has_my_local_txns = False
+    for txn in block:
+        if txn["sender"] == my_id:
+            block_has_my_local_txns = True
+            break
+
+    return block_has_my_local_txns
+
+
 # Add a transaction to the client's local_transactions list
 def update_local_transactions(txn):
     """
@@ -360,7 +379,7 @@ def update_local_transactions(txn):
 
         last_unsumbmited_users_txn = {}# empty out the list
     else:
-        print("Aborted transaction from {0} to {1} for ${2} (balance is not enough)".format(tnx["sender"], txn["recipient"], txn["amount"]))
+        print("Aborted transaction from {0} to {1} for ${2} (balance is not enough)".format(txn["sender"], txn["recipient"], txn["amount"]))
 
 
 def update_block_chain(block, seq_num):
@@ -376,7 +395,8 @@ def update_block_chain(block, seq_num):
         "transactions":block,
         "sequence_num": seq_num
     })
-    local_transactions = []
+    if does_commited_block_has_my_transactions(block):
+        local_transactions = []
     logging.info("Client {0}: Updated my blockchain with {1}".format(my_id, json.dumps(block)))
 
 def handle_transaction(my_id, peer, amt):
@@ -443,21 +463,18 @@ def handle_accepted(client, body):
     """
         Handles an ACCEPTED request from the given client and payload
         NOTE: since we're only doing 3 nodes, one accepted leades to a commit phase
-        BUT leader should make sure to receive ALL ACCEPTED messages
+        So leader should NOT wait to receive ALL ACCEPTED messages!
     """
-    global received_accepted_msgs
     global already_multicast_commit
+    global accept_user_commands
 
-    received_accepted_msgs.append(body['TX'])
-    time.sleep(SLEEP_TIME)
-
-    logging.info("client {0}: Received {1} accepted msg ... (ready to commit)".format(my_id, len(received_accepted_msgs)))
+    logging.info("client {0}: Received an accepted msg {1}".format(my_id, json.dumps(body['TX'])))
 
     if not already_multicast_commit:
-        run_commit_phase_by_leader(received_accepted_msgs)
+        run_commit_phase_by_leader([body['TX']])
         already_multicast_commit = True
-
-    accept_user_commands = True
+    else:
+        accept_user_commands = True
 
 
 # After collecting all ACCEPTED messages, it's time to commit
