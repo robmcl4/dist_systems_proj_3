@@ -77,25 +77,36 @@ clients = []
 # for leadership.
 accept_user_commands = True
 
-# The highest previous Promise performed in the Paxos leader-election
-highest_promise = {"block_num": -1, "client_id": -1, "proposal_num": -1}
+# Maps a block number to the highest previous Promise performed in the Paxos leader-election
+# for that block
+map_highest_promise = {}
+
+# A Dict which maps block_num to the Block which was last seen in an Accept
+# Used for leader failure case
+map_last_accepted = {}
 
 # one accepted msg is enough for commit phase but the leader should not ignore other incoming accepted req
 #received_accepted_msgs = []
 
 # to localy save clients transaction (in case that the client needs to run Paxos to update balances, it needs to have access to this very last txn later)
 # format is the same as tnx = {"sender","recipient","amount"}
-last_unsumbmited_users_txn = {}
+last_unsubmitted_users_txn = None
 
 # a flag for not sending accept request to other nodes after leader election
 paxos_for_debug = False
 
-# set this flag to prevent double sending ACCEPT request after leader attained ledaership
+
+# a flag to say that we've already got quorum from leader election, so
+# don't bother broadcasting ACCEPT again
 already_became_leader = False
 
 # since after receiving the first ACCEPTED client can multicast COMMIT msg there is no need to send
 # COMMIT per received ACCEPTED msg
 already_multicast_commit = False
+
+# keeps track of whether one client has already given NACK to promise or accept
+already_got_promise_nack = False
+already_got_accepted_nack = False
 # Implementation -------------------------------------------
 
 def main():
@@ -205,8 +216,7 @@ def handle_channel_update(ready_channel):
             client = c
             break
     assert client is not None
-
-    # read the command (max 2kb)
+# read the command (max 2kb)
     ba = bytearray(2048)
     bytes_rcv = client.socket.recv_into(ba)
     if bytes_rcv == 0:
@@ -216,25 +226,38 @@ def handle_channel_update(ready_channel):
         logging.info('Client {0} connection closed!'.format(client.id))
         return
 
+    # there may be multiple commands that we just read, split those up
+    cmds = ba[:bytes_rcv].decode('ascii').strip().split('\n')
+    # handle each command that was waiting
+    for cmd in cmds:
     # decode the command and body
-    cmd, body = ba[:bytes_rcv].decode('ascii').split(' ')
-    # body should be base64(json(data))
-    body = json.loads(base64.b64decode(body).decode('ascii'))
+        splat = cmd.split(' ')
+        if len(splat) != 2:
+            print(splat, "!!!!!!!!!!!!!!!")
+            assert False
+        else:
+            cmd, body = splat
+        # body should be base64(json(data))
+        body = json.loads(base64.b64decode(body).decode('ascii'))
 
-    logging.info('received {0} from client {1}'.format(cmd, client.id))
+        logging.info('received {0} from client {1}'.format(cmd, client.id))
 
-    if cmd == 'PREPARE':
-        handle_prepare(client, body)
-    elif cmd == 'PROMISE':
-        handle_promise(client, body)
-    elif cmd == "ACCEPT": # from leader to other clients
-        handle_accept(client, body)
-    elif cmd == "ACCEPTED": #from clients to the leader
-        handle_accepted(client, body)
-    elif cmd == "COMMIT":
-        handle_commit(client, body)
-    else:
-        logging.info('unknown command: {0}'.format(cmd))
+        if cmd == 'PREPARE':
+            handle_prepare(client, body)
+        elif cmd == 'PROMISE':
+            handle_promise(client, body)
+        elif cmd == 'PROMISE_NACK':
+            handle_promise_nack(client, body)
+        elif cmd == "ACCEPT": # from leader to other clients
+            handle_accept(client, body)
+        elif cmd == "ACCEPTED": #from clients to the leader
+            handle_accepted(client, body)
+        elif cmd == "ACCEPTED_NACK":
+            handle_accepted_nack(client, body)
+        elif cmd == "COMMIT":
+            handle_commit(client, body)
+        else:
+            logging.info('unknown command: {0}'.format(cmd))
 
 
 def handle_user_command():
@@ -248,6 +271,9 @@ def handle_user_command():
         # FOR DEBUGGING ONLY: initiate a paxos round
         paxos_for_debug = True
         initiate_leader_election()
+    elif cmd == 'x':
+        # FOR DEBUGGING ONLY: print the blockchain
+        print_blockchain()
     elif cmd == 't':
         while True:
             try:
@@ -270,9 +296,42 @@ def handle_user_command():
         for c in clients:
             logging.info('shutting down...')
             c.socket.close()
-            exit(0)
+        exit(0)
     else:
         print('unknown command', cmd)
+
+
+def handle_promise_nack(client, body):
+    global already_got_promise_nack
+    global last_unsubmitted_users_txn
+    global accept_user_commands
+    global proposal_num
+
+    if already_got_promise_nack:
+        logging.info("Got second NACK to propose, aborting!!!")
+        print("Transaction aborted.")
+        last_unsubmitted_users_txn = None
+        accept_user_commands = True
+    else:
+        logging.info("Got first NACK to propose")
+        proposal_num = max(proposal_num, body["highest_proposal"] + 1)
+        logging.info("Advancing local proposal_num to {0}, must be behind".format(proposal_num))
+        save_state()
+        already_got_promise_nack = True
+
+def handle_accepted_nack(client, body):
+    global already_got_accepted_nack
+    global last_unsubmitted_users_txn
+    global accept_user_commands
+
+    if already_got_accepted_nack:
+        logging.info("Got second NACK to accept, aborting!!!")
+        print("Transaction aborted.")
+        last_unsubmitted_users_txn = None
+        accept_user_commands = True
+    else:
+        logging.info("Got first NACK to accept")
+        already_got_accepted_nack = True
 
 # Helpers for user commands ------------------------------------
 
@@ -281,16 +340,33 @@ def initiate_leader_election():
     global accept_user_commands
     global already_became_leader
     global already_multicast_commit
+    global already_got_promise_nack
+    global already_got_accepted_nack
 
     accept_user_commands = False
-    already_became_leader = False
     already_multicast_commit = False
+    already_became_leader = False
+    already_got_promise_nack = False
+    already_got_accepted_nack = False
 
+    # Perform a PREPARE on ourselves (each site has a participant, so do I)
     proposal_num += 1
+    target_block_num = len(blockchain)
+    if target_block_num in map_highest_promise:
+        # make our proposal higher than any of our own promises so
+        # we don't need to self-NACK, which would be silly
+        proposal_num = max(proposal_num, map_highest_promise["proposal_num"] + 1)
+    else:
+        # just set this up for us later
+        map_highest_promise[target_block_num] = {}
+    # store the promise
+    map_highest_promise[target_block_num]['proposal_num'] = proposal_num
+    map_highest_promise[target_block_num]['proposing_client_id'] = my_id
+
     save_state()
 
     # broadcast PREPARE
-    data = {"proposal_num": proposal_num, "block_num": len(blockchain)}
+    data = {"proposal_num": proposal_num, "block_num": target_block_num}
     logging.info("Initiating leader election for proposal_num {0}, block_num {1}".format(proposal_num, len(blockchain)))
     for c in clients:
         send_message(c, "PREPARE", data)
@@ -306,42 +382,58 @@ def handle_promise(client, data):
     leadership attained
     """
     global already_became_leader
-
-    logging.info("Leadership attained...")
-
-    if not already_became_leader and not paxos_for_debug:
+    if already_became_leader:
+        logging.info("Redundant PROMISE after quorum, ignoring")
+        return
+    else:
         already_became_leader = True
-        run_accept_phase_by_leader()
+        logging.info("Leadership attained.")
+
+    if not paxos_for_debug:
+        run_accept_phase_by_leader(client.id, data)
+
 
 def handle_prepare(client, data):
     """
     Handles a PREPARE from the given client and payload
     """
-    if data['block_num'] < len(blockchain):
-        # If the block_num number is old, respond with existing block
-        resp_data = {"existing_block": blockchain[data['block_num']]}
-        logging.info('PROMISE was for old block_num {0}'.format(data['block_num']))
-        send_message(client, "USE_EXISTING", resp_data)
-    elif highest_promise['block_num'] == data['block_num'] and (
-                highest_promise['client_id'] > client.id
+    target_block_num = data['block_num']
+    if target_block_num in map_highest_promise and (
+                map_highest_promise[target_block_num]['proposal_num'] > data['proposal_num']
                 or
                 (
-                    highest_promise['client_id'] == client.id and
-                    highest_promise['proposal_num'] > data['proposal_num']
+                    map_highest_promise[target_block_num]['proposal_num'] == data['proposal_num'] and
+                    map_highest_promise[target_block_num]['proposing_client_id'] > client.id
                 )
                 ):
-        # If we've done PROMISE for a higher client_id or proposal_num,
+        # If we've done PROMISE for a higher proposal (using client_id as tie-breaker),
         # then NACK
-        send_message(client, "PROMISE_NACK", None)
+        send_message(client, "PROMISE_NACK", {
+                "proposal_num": data['proposal_num'],
+                "block_num": data['block_num'],
+                "highest_proposal": map_highest_promise[target_block_num]['proposal_num']
+            })
     else:
-        assert data['block_num'] == len(blockchain)
         # All seems well, continue with the promise
-        highest_promise['block_num'] = data['block_num']
-        highest_promise['proposal_num'] = data['proposal_num']
-        highest_promise['client_id'] = client.id
+
+        # record the promise
+        if target_block_num not in map_highest_promise:
+            map_highest_promise[target_block_num] = {}
+        map_highest_promise[target_block_num]['proposal_num'] = data['proposal_num']
+        map_highest_promise[target_block_num]['proposing_client_id'] = client.id
         save_state()
+
+        # value discovery -- see if we've persisted something the new leader should echo
+        block_to_send = map_last_accepted.get(target_block_num, None)
+        if block_to_send is not None:
+            logging.info('Replying to Promise with previously ACCEPTed transactions')
         logging.info('Promising client {0} with proposal {1} for block_num {2}'.format(client.id, data['proposal_num'], data['block_num']))
-        send_message(client, "PROMISE", None)
+        send_message(client, "PROMISE", {
+                "proposal_num": data['proposal_num'],
+                "block_num": data['block_num'],
+                "prev_accept": block_to_send,
+                "local_txns": local_transactions
+            })
 
 
 def does_commited_block_has_my_transactions(block):
@@ -352,17 +444,14 @@ def does_commited_block_has_my_transactions(block):
     if the client does not see her transactions in the commited blocks
     she should still keep them locally
     """
-    block_has_my_local_txns = False
-    for txn in block:
+    for txn in block["transactions"]:
         if txn["sender"] == my_id:
-            block_has_my_local_txns = True
-            break
-
-    return block_has_my_local_txns
+            return True
+    return False
 
 
 # Add a transaction to the client's local_transactions list
-def update_local_transactions(txn):
+def add_or_abort_unsubmitted_user_txn():
     """
     Perform an-uncommitted transaction and added to the local_transactions
 
@@ -370,19 +459,23 @@ def update_local_transactions(txn):
     or after running Paxos and updating the blockchain
     """
     global local_transactions
-
+    global last_unsubmitted_users_txn
+    txn = last_unsubmitted_users_txn
+    if txn is None:
+        logging.warn("last_unsubmitted_users_txn was None!?!?!")
+        return
     if query_balance(my_id) >= txn["amount"]:
 
         local_transactions.append(txn)
         logging.info('client {0}: Updated local transactions: {1}'.format(my_id,json.dumps(local_transactions)))
         print("successful transaction from {0} to {1} for ${2}".format(txn["sender"], txn["recipient"], txn["amount"]))
-
-        last_unsumbmited_users_txn = {}# empty out the list
     else:
         print("Aborted transaction from {0} to {1} for ${2} (balance is not enough)".format(txn["sender"], txn["recipient"], txn["amount"]))
+    # it's either added or aborted, either way, clear
+    last_unsubmitted_users_txn = None
 
 
-def update_block_chain(block, seq_num):
+def update_block_chain(block, block_number):
     """
     Add a block containing all commited local transactions to the ledger
     Empty the local transactions of the client
@@ -390,13 +483,12 @@ def update_block_chain(block, seq_num):
     global blockchain
     global local_transactions
 
-    blockchain.append(
-    {
-        "transactions":block,
-        "proposal_num": seq_num
-    })
-    if does_commited_block_has_my_transactions(block):
-        local_transactions = []
+    if block_number == len(blockchain):
+        blockchain.append(block)
+        if does_commited_block_has_my_transactions(block):
+            local_transactions = []
+    else:
+        blockchain[block_number] = block
     logging.info("Client {0}: Updated my blockchain with {1}".format(my_id, json.dumps(block)))
 
 def handle_transaction(my_id, peer, amt):
@@ -408,53 +500,92 @@ def handle_transaction(my_id, peer, amt):
     """
     global proposal_num
     global accept_user_commands
-    global last_unsumbmited_users_txn
+    global last_unsubmitted_users_txn
 
     accept_user_commands = False
 
-    last_unsumbmited_users_txn = {
+    last_unsubmitted_users_txn = {
         "recipient": peer,
         "sender": my_id,
         "amount": amt,
         }
     estimate_balance = query_balance(my_id)
     if (amt <= estimate_balance):
-        update_local_transactions(last_unsumbmited_users_txn)
+        add_or_abort_unsubmitted_user_txn()
         accept_user_commands = True
     else:
         initiate_leader_election()
 
-        #TODO: show the abort msg if client chould'nt become a leader
-        # logging.info('Transaction from client {0} to {1} for ${2} aborted. Client {0} couldnt manage to become a leader'.format(my_id,peer,amt))
-        # accept_user_commands = True
-
-def run_accept_phase_by_leader():
+def run_accept_phase_by_leader(client_id, data):
     """
-    When the client got elected, it can send accept msg to others (for the last unsumbitted txn)
+    When the client got elected, it can send accept msg to others.
+    ACCEPT contains a new block that will be committed later
     """
-    global proposal_num
-    global local_transactions
+    target_block_num = data["block_num"]
+    #
+    # figure out which block we'll be sending in ACCEPT
+    block_to_accept = None # stores decided block to send out
 
-    proposal_num += 1
-    data = {"TX":local_transactions, "proposal_num": proposal_num}
+    # make list of blocks that are accepted to consider
+    already_accepted = []
+    if target_block_num in map_last_accepted:
+        already_accepted.append(map_last_accepted[target_block_num])
+    if data.get('prev_accept', None) is not None:
+        already_accepted.append(data['prev_accept'])
+
+    # if there's a previously-accepted value, we MUST adopt that block
+    if len(already_accepted) > 0:
+        already_accepted = sorted(already_accepted, key = lambda x: (x["proposal_num"], x["proposing_client_id"]))
+        block_to_accept = already_accepted[-1]
+        logging.info("Using previously accepted block, proposal_num {0}, client_id {1}".format(
+            block_to_accept["proposal_num"],
+            block_to_accept["proposing_client_id"]
+        ))
+    else:
+        # otherwise, make our own new block
+        block_to_accept = {
+            "transactions": local_transactions + data['local_txns'],
+            "proposal_num": data["proposal_num"],
+            "proposing_client_id": my_id
+        }
+        logging.info("Constructed new block, sending to be accepted...")
+
+    # update w/ my details
+    block_to_accept["proposal_num"] = data["proposal_num"]
+    block_to_accept["proposing_client_id"] = my_id
+    # record this block in the accepted values map
+    map_last_accepted[target_block_num] = block_to_accept
+    logging.info("Stored new acceptVal for block = {0}".format(target_block_num))
+
+    # send out the block
     for c in clients:
-        send_message(c, "ACCEPT", data)
+        send_message(c, "ACCEPT", {
+                "proposal_num": data["proposal_num"],
+                "block_num": data["block_num"],
+                "block": block_to_accept
+            })
 
 
 def handle_accept(client, data):
     """
     Handles an ACCEPT request from the given client and payload
     """
-    global proposal_num
-
-    if data['proposal_num'] < proposal_num:
+    target_block_num = data["block_num"]
+    assert target_block_num in map_highest_promise
+    print(data)
+    print(map_highest_promise)
+    if data['proposal_num'] < map_highest_promise[target_block_num]["proposal_num"] or \
+        (
+            data['proposal_num'] == map_highest_promise[target_block_num]['proposal_num'] and
+            client.id < map_highest_promise[target_block_num]['proposing_client_id']
+        ):
         # this is an old accept message
         #(e.g, after a server became a leader, another one asked for election
         # so the firts leader should not be able to multicast accept/commit msgs)
         logging.info("client {}:Ignore ACCEPT message from client {} since the ballot number is outdated".format(my_id, client.id))
-
+        send_message(client, "ACCEPTED_NACK", {"proposal_num": data["proposal_num"], "block_num": data["block_num"]})
     else:
-        data = {"TX":local_transactions, "proposal_num": proposal_num}
+        map_last_accepted[target_block_num] = data["block"]
         logging.info("client {}: ACCEPTED client {}'s accept request with ballot num {}'".format(my_id, client.id, data['proposal_num']))
         send_message(client, "ACCEPTED", data)
 
@@ -468,50 +599,43 @@ def handle_accepted(client, body):
     global already_multicast_commit
     global accept_user_commands
 
-    logging.info("client {0}: Received an accepted msg {1}".format(my_id, json.dumps(body['TX'])))
+    logging.info("client {0}: Received an accepted msg with block {1}".format(my_id, json.dumps(body['block'])))
 
     if not already_multicast_commit:
-        run_commit_phase_by_leader([body['TX']])
+        run_commit_phase_by_leader(body)
         already_multicast_commit = True
-    else:
-        accept_user_commands = True
 
 
-# After collecting all ACCEPTED messages, it's time to commit
-def run_commit_phase_by_leader(clients_local_transactions):
+# After collecting an ACCEPTED messages, it's time to commit
+def run_commit_phase_by_leader(data):
     """
     When client received f ACCEPTED msg it will generate block B and multicast COMMIT
     """
-    global blockchain
-    global local_transactions
-    global proposal_num
-    global already_became_leader
-    global already_multicast_commit
+    global accept_user_commands
 
-    block = local_transactions
-    for txn in clients_local_transactions:
-        block.extend(txn)
-    #seq_num = len(blockchain) ?
-
-    data = {"block": block, "proposal_num": proposal_num}
+    block = data["block"]
     for c in clients:
-        send_message(c,"COMMIT",data)
+        send_message(c,"COMMIT",
+                {
+                    "block": block,
+                    "proposal_num":
+                    data["proposal_num"],
+                    "block_num": data["block_num"]
+                })
 
-    update_block_chain(block, proposal_num)
-
-    clients_local_transactions = []# empty out the list
-    update_local_transactions(last_unsumbmited_users_txn)
+    update_block_chain(block, data["block_num"])
+    add_or_abort_unsubmitted_user_txn()
 
     accept_user_commands = True
-    already_became_leader = False
-    already_multicast_commit = False
 
 def handle_commit(client, body):
     """
     Handles a COMMIT request from the given client and payload
     """
-    update_block_chain(body['block'], body['proposal_num'])
+    update_block_chain(body['block'], body['block_num'])
     logging.info("client {0}: Receive a COMMIT request from client {1} with block: {2}".format(my_id, client.id,json.dumps(body['block'])))
+    update_block_chain(body['block'], body["block_num"])
+    logging.info("Finished COMMIT")
 
 
 # Helpers for both user and client  commands ---------------------
@@ -537,8 +661,17 @@ def query_balance(peer_id):
     return balance
 
 
+def print_blockchain():
+    print("Blockchain:")
+    for i, block in enumerate(blockchain):
+        print("Block {0}, proposal_num {1}, sender {2}:"
+                .format(i, block["proposal_num"], block["proposing_client_id"]))
+        for txn in block["transactions"]:
+            print("    {0} -> {1} ${2:.2f}".format(txn["sender"], txn["recipient"], txn["amount"]))
+
+
 def print_menu():
-    sys.stdout.write("[B]alance [Q]uit: [T]ransfer money [E]nable crash mode?!")
+    sys.stdout.write("[B]alance [Q]uit [T]ransfer money: ")
     sys.stdout.flush()
 
 
@@ -550,7 +683,7 @@ def save_state():
     with open(fname, "w") as f:
         sz_blocks = base64.b64encode(pickle.dumps(blockchain)).decode("ascii")
         sz_local_txns = base64.b64encode(pickle.dumps(local_transactions)).decode("ascii")
-        sz_highest_promise = base64.b64encode(pickle.dumps(highest_promise))
+        sz_highest_promise = base64.b64encode(pickle.dumps(map_highest_promise))
         f.write("{0} {1} {2} {3}".format(proposal_num, sz_blocks, sz_local_txns, sz_highest_promise))
     logging.info("Persisted blockchain in file {0}".format(fname))
 
@@ -562,7 +695,7 @@ def restore_saved_state():
     global proposal_num
     global blockchain
     global local_transactions
-    global highest_promise
+    global map_highest_promise
     fname = "chain.{0}.json".format(my_id)
     logging.info("Examining {0} for previous blockchains".format(fname))
     try:
@@ -572,7 +705,7 @@ def restore_saved_state():
             proposal_num = int(sz_proposal_num)
             blockchain = pickle.loads(base64.b64decode(b64chains))
             local_transactions = pickle.loads(base64.b64decode(b64locals))
-            highest_promise = pickle.loads(base64.b64decode(b64promise))
+            map_highest_promise = pickle.loads(base64.b64decode(b64promise))
             logging.info("Restored {0} blocks, {1} unsent transactions, and proposal_num = {2}".format(
                 len(blockchain),
                 len(local_transactions),
@@ -593,7 +726,7 @@ def send_message(client, command, data):
     logging.info('Sending {0} to {1} ...'.format(command, client.id))
     b64_data = base64.b64encode(json.dumps(data).encode('ascii'))
     time.sleep(SLEEP_TIME)
-    client.socket.send(command.encode('ascii') + b' ' + b64_data)
+    client.socket.send(command.encode('ascii') + b' ' + b64_data + b'\n')
 
 
 if __name__ == '__main__':
