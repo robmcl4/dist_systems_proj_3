@@ -51,7 +51,7 @@ Transaction = collections.namedtuple(
 Block = collections.namedtuple(
     "Block",
     [
-        "transactions", "sequence_num"
+        "transactions", "proposal_num", "proposing_client_id"
     ]
 )
 
@@ -78,7 +78,7 @@ clients = []
 accept_user_commands = True
 
 # The highest previous Promise performed in the Paxos leader-election
-highest_promise = {"epoch": -1, "client_id": -1, "proposal_num": -1}
+highest_promise = {"block_num": -1, "client_id": -1, "proposal_num": -1}
 
 # one accepted msg is enough for commit phase but the leader should not ignore other incoming accepted req
 #received_accepted_msgs = []
@@ -290,8 +290,8 @@ def initiate_leader_election():
     save_state()
 
     # broadcast PREPARE
-    data = {"proposal_num": proposal_num, "epoch": len(blockchain)}
-    logging.info("Initiating leader election for proposal_num {0}, epoch {1}".format(proposal_num, len(blockchain)))
+    data = {"proposal_num": proposal_num, "block_num": len(blockchain)}
+    logging.info("Initiating leader election for proposal_num {0}, block_num {1}".format(proposal_num, len(blockchain)))
     for c in clients:
         send_message(c, "PREPARE", data)
 
@@ -317,12 +317,12 @@ def handle_prepare(client, data):
     """
     Handles a PREPARE from the given client and payload
     """
-    if data['epoch'] < len(blockchain):
-        # If the epoch number is old, respond with existing block
-        resp_data = {"existing_block": blockchain[data['epoch']]}
-        logging.info('PROMISE was for old epoch {0}'.format(data['epoch']))
+    if data['block_num'] < len(blockchain):
+        # If the block_num number is old, respond with existing block
+        resp_data = {"existing_block": blockchain[data['block_num']]}
+        logging.info('PROMISE was for old block_num {0}'.format(data['block_num']))
         send_message(client, "USE_EXISTING", resp_data)
-    elif highest_promise['epoch'] == data['epoch'] and (
+    elif highest_promise['block_num'] == data['block_num'] and (
                 highest_promise['client_id'] > client.id
                 or
                 (
@@ -334,13 +334,13 @@ def handle_prepare(client, data):
         # then NACK
         send_message(client, "PROMISE_NACK", None)
     else:
-        assert data['epoch'] == len(blockchain)
+        assert data['block_num'] == len(blockchain)
         # All seems well, continue with the promise
-        highest_promise['epoch'] = data['epoch']
+        highest_promise['block_num'] = data['block_num']
         highest_promise['proposal_num'] = data['proposal_num']
         highest_promise['client_id'] = client.id
         save_state()
-        logging.info('Promising client {0} with proposal {1} for epoch {2}'.format(client.id, data['proposal_num'], data['epoch']))
+        logging.info('Promising client {0} with proposal {1} for block_num {2}'.format(client.id, data['proposal_num'], data['block_num']))
         send_message(client, "PROMISE", None)
 
 
@@ -393,7 +393,7 @@ def update_block_chain(block, seq_num):
     blockchain.append(
     {
         "transactions":block,
-        "sequence_num": seq_num
+        "proposal_num": seq_num
     })
     if does_commited_block_has_my_transactions(block):
         local_transactions = []
