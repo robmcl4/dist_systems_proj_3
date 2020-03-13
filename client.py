@@ -41,20 +41,6 @@ Client = collections.namedtuple(
     ]
 )
 
-Transaction = collections.namedtuple(
-    "Transaction",
-    [
-        "id", "sender", "recipient", "amount"
-    ]
-)
-
-Block = collections.namedtuple(
-    "Block",
-    [
-        "transactions", "proposal_num", "proposing_client_id"
-    ]
-)
-
 # GLOBALS --------------------------------------------------
 
 # List of Blocks, most recent block out front
@@ -107,11 +93,15 @@ already_multicast_commit = False
 # keeps track of whether one client has already given NACK to promise or accept
 already_got_promise_nack = False
 already_got_accepted_nack = False
+
+# whether recovery is in progress
+recovering = False
 # Implementation -------------------------------------------
 
 def main():
     global my_id
     global clients
+    global recovering
     # find my client id
     if len(sys.argv) < 2:
         print("Please enter a process index (1,2,3,...)")
@@ -142,7 +132,10 @@ def main():
     sock.listen(5)
     logging.info("listening for connections on port {0}".format(BASE_PORT_NUMBER - 1 + my_id))
 
-    restore_saved_state()
+    recovering = restore_saved_state()
+    if recovering:
+        logging.info("----- entering recovery mode, catching up ------")
+        initiate_leader_election()
 
     # begin poll loop
     listen_loop(sock)
@@ -216,12 +209,19 @@ def handle_channel_update(ready_channel):
             client = c
             break
     assert client is not None
-# read the command (max 2kb)
+    # read the command (max 2kb)
     ba = bytearray(2048)
-    bytes_rcv = client.socket.recv_into(ba)
+    bytes_rcv = 0
+    try:
+        bytes_rcv = client.socket.recv_into(ba)
+    except ConnectionResetError:
+        logging.info("Caught exception reading socket, did client close?")
     if bytes_rcv == 0:
         # this indicates EOF -- closed connection
-        client.socket.close()
+        try:
+            client.socket.close()
+        except:
+            logging.info("Could not close client")
         clients.remove(client)
         logging.info('Client {0} connection closed!'.format(client.id))
         return
@@ -308,10 +308,15 @@ def handle_promise_nack(client, body):
     global proposal_num
 
     if already_got_promise_nack:
+        if recovering:
+            # try again
+            initiate_leader_election()
+            return
         logging.info("Got second NACK to propose, aborting!!!")
         print("Transaction aborted.")
         last_unsubmitted_users_txn = None
         accept_user_commands = True
+        save_state()
     else:
         logging.info("Got first NACK to propose")
         proposal_num = max(proposal_num, body["highest_proposal"] + 1)
@@ -325,10 +330,14 @@ def handle_accepted_nack(client, body):
     global accept_user_commands
 
     if already_got_accepted_nack:
+        if recovering:
+            initiate_leader_election()
+            return # try again
         logging.info("Got second NACK to accept, aborting!!!")
         print("Transaction aborted.")
         last_unsubmitted_users_txn = None
         accept_user_commands = True
+        save_state()
     else:
         logging.info("Got first NACK to accept")
         already_got_accepted_nack = True
@@ -397,6 +406,10 @@ def handle_prepare(client, data):
     """
     Handles a PREPARE from the given client and payload
     """
+    if recovering:
+        # eat the message -- do nothing
+        logging.info("Not handling PREPARE -- too busy recovering")
+        return
     target_block_num = data['block_num']
     if target_block_num in map_highest_promise and (
                 map_highest_promise[target_block_num]['proposal_num'] > data['proposal_num']
@@ -473,6 +486,7 @@ def add_or_abort_unsubmitted_user_txn():
         print("Aborted transaction from {0} to {1} for ${2} (balance is not enough)".format(txn["sender"], txn["recipient"], txn["amount"]))
     # it's either added or aborted, either way, clear
     last_unsubmitted_users_txn = None
+    save_state()
 
 
 def update_block_chain(block, block_number):
@@ -489,6 +503,7 @@ def update_block_chain(block, block_number):
             local_transactions = []
     else:
         blockchain[block_number] = block
+    save_state()
     logging.info("Client {0}: Updated my blockchain with {1}".format(my_id, json.dumps(block)))
 
 def handle_transaction(my_id, peer, amt):
@@ -521,6 +536,12 @@ def run_accept_phase_by_leader(client_id, data):
     When the client got elected, it can send accept msg to others.
     ACCEPT contains a new block that will be committed later
     """
+    global recovering
+    global already_multicast_commit
+    # HACK -- sometimes the response to a recovering process ACCEPT
+    # comes a little late and messes things up, re-set it here
+    already_multicast_commit = False
+
     target_block_num = data["block_num"]
     #
     # figure out which block we'll be sending in ACCEPT
@@ -549,6 +570,9 @@ def run_accept_phase_by_leader(client_id, data):
             "proposing_client_id": my_id
         }
         logging.info("Constructed new block, sending to be accepted...")
+        if recovering:
+            logging.info("Recovery has completed --")
+            recovering = False
 
     # update w/ my details
     block_to_accept["proposal_num"] = data["proposal_num"]
@@ -570,10 +594,12 @@ def handle_accept(client, data):
     """
     Handles an ACCEPT request from the given client and payload
     """
+
+    if recovering:
+        logging.info("Ignoring ACCEPT -- too busy recovering")
+        return
     target_block_num = data["block_num"]
     assert target_block_num in map_highest_promise
-    print(data)
-    print(map_highest_promise)
     if data['proposal_num'] < map_highest_promise[target_block_num]["proposal_num"] or \
         (
             data['proposal_num'] == map_highest_promise[target_block_num]['proposal_num'] and
@@ -604,6 +630,8 @@ def handle_accepted(client, body):
     if not already_multicast_commit:
         run_commit_phase_by_leader(body)
         already_multicast_commit = True
+    else:
+        logging.info("Ignoring redundant ACCEPTED")
 
 
 # After collecting an ACCEPTED messages, it's time to commit
@@ -624,14 +652,21 @@ def run_commit_phase_by_leader(data):
                 })
 
     update_block_chain(block, data["block_num"])
-    add_or_abort_unsubmitted_user_txn()
-
-    accept_user_commands = True
+    if not recovering:
+        add_or_abort_unsubmitted_user_txn()
+        accept_user_commands = True
+    else:
+        # recovery -- start another leader election to get more blocks
+        initiate_leader_election()
+        
 
 def handle_commit(client, body):
     """
     Handles a COMMIT request from the given client and payload
     """
+    if recovering:
+        logging.info("Ignoring COMMIT -- too busy recovering")
+        return
     update_block_chain(body['block'], body['block_num'])
     logging.info("client {0}: Receive a COMMIT request from client {1} with block: {2}".format(my_id, client.id,json.dumps(body['block'])))
     update_block_chain(body['block'], body["block_num"])
@@ -679,12 +714,17 @@ def save_state():
     """
     Persists the current global state in file storage
     """
+    to_save = [
+            proposal_num,
+            blockchain,
+            local_transactions,
+            map_highest_promise,
+            map_last_accepted,
+            last_unsubmitted_users_txn
+    ]
     fname = "chain.{0}.json".format(my_id)
     with open(fname, "w") as f:
-        sz_blocks = base64.b64encode(pickle.dumps(blockchain)).decode("ascii")
-        sz_local_txns = base64.b64encode(pickle.dumps(local_transactions)).decode("ascii")
-        sz_highest_promise = base64.b64encode(pickle.dumps(map_highest_promise))
-        f.write("{0} {1} {2} {3}".format(proposal_num, sz_blocks, sz_local_txns, sz_highest_promise))
+        f.write(json.dumps(to_save))
     logging.info("Persisted blockchain in file {0}".format(fname))
 
 
@@ -696,23 +736,23 @@ def restore_saved_state():
     global blockchain
     global local_transactions
     global map_highest_promise
+    global map_last_accepted
+    global last_unsubmitted_users_txn
+    
     fname = "chain.{0}.json".format(my_id)
     logging.info("Examining {0} for previous blockchains".format(fname))
     try:
         with open(fname) as f:
-            txt = f.read()
-            sz_proposal_num, b64chains, b64locals, b64promise = txt.split(' ')
-            proposal_num = int(sz_proposal_num)
-            blockchain = pickle.loads(base64.b64decode(b64chains))
-            local_transactions = pickle.loads(base64.b64decode(b64locals))
-            map_highest_promise = pickle.loads(base64.b64decode(b64promise))
-            logging.info("Restored {0} blocks, {1} unsent transactions, and proposal_num = {2}".format(
-                len(blockchain),
-                len(local_transactions),
-                proposal_num
-            ))
+            proposal_num, \
+            blockchain, \
+            local_transactions, \
+            map_highest_promise, \
+            map_last_accepted, \
+            last_unsubmitted_users_txn  = json.loads(f.read())
+        return True
     except FileNotFoundError:
         logging.info("No backup found.")
+    return False
 
 
 def send_message(client, command, data):
@@ -723,6 +763,7 @@ def send_message(client, command, data):
     command: str, the command
     data: json-serializable object
     """
+    save_state()
     logging.info('Sending {0} to {1} ...'.format(command, client.id))
     b64_data = base64.b64encode(json.dumps(data).encode('ascii'))
     time.sleep(SLEEP_TIME)
