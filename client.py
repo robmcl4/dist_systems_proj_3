@@ -364,7 +364,7 @@ def initiate_leader_election():
     if target_block_num in map_highest_promise:
         # make our proposal higher than any of our own promises so
         # we don't need to self-NACK, which would be silly
-        proposal_num = max(proposal_num, map_highest_promise["proposal_num"] + 1)
+        proposal_num = max(proposal_num, map_highest_promise[target_block_num]["proposal_num"] + 1)
     else:
         # just set this up for us later
         map_highest_promise[target_block_num] = {}
