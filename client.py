@@ -667,7 +667,6 @@ def handle_commit(client, body):
     if recovering:
         logging.info("Ignoring COMMIT -- too busy recovering")
         return
-    update_block_chain(body['block'], body['block_num'])
     logging.info("client {0}: Receive a COMMIT request from client {1} with block: {2}".format(my_id, client.id,json.dumps(body['block'])))
     update_block_chain(body['block'], body["block_num"])
     logging.info("Finished COMMIT")
